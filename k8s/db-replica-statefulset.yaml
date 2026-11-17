@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-replica-headless
+  labels:
+    app: db-replica
+spec:
+  clusterIP: None
+  ports:
+    - port: 5432
+      name: postgres
+  selector:
+    app: db-replica
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-replica
+  labels:
+    app: db-replica
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: db-replica
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db-replica
+  labels:
+    app: db-replica
+spec:
+  serviceName: db-replica-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db-replica
+  template:
+    metadata:
+      labels:
+        app: db-replica
+    spec:
+      containers:
+        - name: postgres-replica
+          image: postgres:15
+          command:
+            - /bin/bash
+            - /scripts/entrypoint.sh
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: PRIMARY_HOST
+              value: "db-primary"
+            - name: PRIMARY_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: POSTGRES_PASSWORD
+            - name: REPLICATION_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: REPLICATION_USER
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: REPLICATION_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: entrypoint-script
+              mountPath: /scripts/entrypoint.sh
+              subPath: entrypoint.sh
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER"
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: entrypoint-script
+          configMap:
+            name: postgres-replica-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app.kubernetes.io/part-of: uts-sbd
+data:
+  # Konfigurasi Database Primary & Replica
+  POSTGRES_DB: "uts_sbd"
+  POSTGRES_USER: "postgres"
+  REPLICATION_USER: "replicator"
+  
+  # Host & Port mengarah langsung ke nama Service Kubernetes
+  DB_HOST: "db-primary"
+  DB_PORT: "5432"
+  REPLICA_DB_HOST: "db-replica"
+  REPLICA_DB_PORT: "5432"
+  
+  # Keycloak
+  KEYCLOAK_ADMIN: "admin"
+  KEYCLOAK_URL: "http://keycloak:8080"
+  KEYCLOAK_REALM: "uts-sbd"
+  KEYCLOAK_CLIENT_ID: "backend-client"
+  
+  # App
+  APP_ENV: "production"
+  JWT_ALGORITHM: "HS256"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-primary-init
+  labels:
+    app.kubernetes.io/part-of: uts-sbd
+data:
+  init.sh: |
+    #!/bin/bash
+    set -e
+    echo ">>> [PRIMARY K8S] Inisialisasi User Replikasi: ${REPLICATION_USER}"
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        CREATE USER ${REPLICATION_USER}
+            WITH REPLICATION
+            ENCRYPTED PASSWORD '${REPLICATION_PASSWORD}';
+    EOSQL
+
+    echo ">>> [PRIMARY K8S] Konfigurasi pg_hba.conf untuk replikasi streaming..."
+    cat >> "$PGDATA/pg_hba.conf" <<EOF
+
+    # Replication access untuk pod di cluster Kubernetes
+    host    replication     ${REPLICATION_USER}     0.0.0.0/0     md5
+    EOF
+
+    echo ">>> [PRIMARY K8S] Konfigurasi postgresql.conf..."
+    cat >> "$PGDATA/postgresql.conf" <<EOF
+
+    wal_level = replica
+    max_wal_senders = 5
+    max_replication_slots = 5
+    wal_keep_size = 128MB
+    hot_standby = on
+    synchronous_commit = on
+    EOF
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-replica-init
+  labels:
+    app.kubernetes.io/part-of: uts-sbd
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -e
+
+    PRIMARY_HOST="${PRIMARY_HOST:-db-primary}"
+    PRIMARY_PORT="${PRIMARY_PORT:-5432}"
+    REPLICATION_USER="${REPLICATION_USER:-replicator}"
+    REPLICATION_PASSWORD="${REPLICATION_PASSWORD:-replicator_password}"
+    PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
+
+    run_as_postgres() {
+      if [ "$(id -u)" = '0' ]; then
+        if command -v gosu >/dev/null 2>&1; then
+          gosu postgres "$@"
+        else
+          su -s /bin/bash postgres -c "$*"
+        fi
+      else
+        "$@"
+      fi
+    }
+
+    echo ">>> [REPLICA K8S] Menunggu primary (${PRIMARY_HOST}:${PRIMARY_PORT}) siap..."
+    export PGPASSWORD="$REPLICATION_PASSWORD"
+
+    until pg_isready -h "$PRIMARY_HOST" -p "$PRIMARY_PORT" -U "$REPLICATION_USER"; do
+      echo ">>> [REPLICA K8S] Primary belum siap, tunggu 3 detik..."
+      sleep 3
+    done
+    echo ">>> [REPLICA K8S] Primary siap!"
+
+    mkdir -p "$PGDATA"
+    if [ "$(id -u)" = '0' ]; then
+      chown -R postgres:postgres "$PGDATA"
+      chmod 700 "$PGDATA"
+    fi
+
+    if [ -z "$(ls -A "$PGDATA" 2>/dev/null)" ]; then
+      echo ">>> [REPLICA K8S] Menjalankan pg_basebackup dari primary..."
+      run_as_postgres pg_basebackup \
+        -h "$PRIMARY_HOST" \
+        -p "$PRIMARY_PORT" \
+        -U "$REPLICATION_USER" \
+        -D "$PGDATA" \
+        --format=plain \
+        --wal-method=stream \
+        --progress \
+        --verbose \
+        -R
+
+      cat >> "$PGDATA/postgresql.auto.conf" <<EOF
+
+    # --- Standby Config ---
+    primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${REPLICATION_USER} password=${REPLICATION_PASSWORD} application_name=replica1'
+    promote_trigger_file = '/tmp/promote_trigger'
+    recovery_min_apply_delay = 0
+    EOF
+
+      if [ "$(id -u)" = '0' ]; then
+        chown -R postgres:postgres "$PGDATA"
+        chmod 700 "$PGDATA"
+      fi
+      echo ">>> [REPLICA K8S] pg_basebackup selesai!"
+    else
+      echo ">>> [REPLICA K8S] Data sudah ada, memulai standby..."
+    fi
+
+    unset PGPASSWORD
+    rm -f "$PGDATA/postmaster.pid"
+
+    if [ "$(id -u)" = '0' ]; then
+      if command -v gosu >/dev/null 2>&1; then
+        exec gosu postgres postgres
+      else
+        exec su -s /bin/bash postgres -c "exec postgres"
+      fi
+    else
+      exec postgres
+    fi

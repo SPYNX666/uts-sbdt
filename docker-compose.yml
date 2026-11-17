@@ -1,0 +1,138 @@
+version: '3.8'
+
+# =============================================================
+# UTS Sistem Basis Data Terdistribusi
+# Services: db-primary | db-replica | keycloak | backend-api
+# =============================================================
+
+services:
+
+  # ─────────────────────────────────────────
+  # 1. PostgreSQL Primary (Write)
+  # ─────────────────────────────────────────
+  db-primary:
+    image: postgres:15
+    container_name: db-primary
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: uts_sbd
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      # Credential khusus untuk replikasi
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_password
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./postgres/primary/init.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    networks:
+      - sbd-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d uts_sbd"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ─────────────────────────────────────────
+  # 2. PostgreSQL Replica (Read-only)
+  # ─────────────────────────────────────────
+  db-replica:
+    image: postgres:15
+    container_name: db-replica
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_password
+      PRIMARY_HOST: db-primary
+      PRIMARY_PORT: 5432
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./postgres/replica/entrypoint.sh:/entrypoint.sh
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    ports:
+      - "5433:5432"
+    networks:
+      - sbd-network
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────
+  # 3. Keycloak (Auth / Identity Provider)
+  # ─────────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    restart: unless-stopped
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin_password
+      KC_HTTP_PORT: 8080
+    command: start-dev
+    ports:
+      - "8080:8080"
+    networks:
+      - sbd-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health/ready || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ─────────────────────────────────────────
+  # 4. Backend API (FastAPI)
+  # ─────────────────────────────────────────
+  backend-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: backend-api
+    restart: unless-stopped
+    environment:
+      # Koneksi ke primary (write) - gunakan dialek postgresql+psycopg2://
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres_password@db-primary:5432/uts_sbd
+      # Koneksi ke replica (read)
+      REPLICA_DATABASE_URL: postgresql+psycopg2://postgres:postgres_password@db-replica:5432/uts_sbd
+      # Keycloak
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: uts-sbd
+      KEYCLOAK_CLIENT_ID: backend-client
+      # App
+      APP_ENV: development
+      SECRET_KEY: ganti-dengan-secret-key-aman-di-production
+    ports:
+      - "8000:8000"
+    networks:
+      - sbd-network
+    depends_on:
+      db-primary:
+        condition: service_healthy
+      db-replica:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+
+# ─────────────────────────────────────────
+# Networks & Volumes
+# ─────────────────────────────────────────
+networks:
+  sbd-network:
+    driver: bridge
+    name: sbd-network
+
+volumes:
+  postgres_primary_data:
+    name: uts_sbd_primary_data
+  postgres_replica_data:
+    name: uts_sbd_replica_data
